@@ -127,6 +127,7 @@ class LMModel(StreamingContainer):
         # Text card + padding token (if not in the original tokenizer)
         extra_text = self.existing_text_padding_id is None
         # Unlike for audio, here we authorize the model to output the special token.
+        # The text_emb is acting on actual text tokens (vocab 32000)
         self.text_emb = EmbeddingFactory(text_card + 1, dim)
         self.text_linear = nn.Linear(dim, text_card + extra_text, bias=bias_proj)
         depformer_prefix = "depformer_"
@@ -237,6 +238,9 @@ class LMModel(StreamingContainer):
     def num_audio_codebooks(self) -> int:
         return self.n_q
 
+    # Q: What does it do and why is it always 1?
+    # - Does it refer to the sementic vs accoustic codebooks?
+    # - No, its seems to refer to text (inner monologue) tokens vs. audio tokens, c.f. `text_emb = self.text_emb(input_sequence[:, 0])`
     @property
     def audio_offset(self) -> int:
         return 1
@@ -257,6 +261,7 @@ class LMModel(StreamingContainer):
         token = torch.cat([text_token, audio_token], dim=1)
         return token
 
+    # 2/0
     def forward_text(
         self,
         sequence: torch.Tensor,
@@ -267,28 +272,44 @@ class LMModel(StreamingContainer):
         ), f"Sequence shape {sequence.shape} must match the number of codebooks."
         input_sequence = sequence
         input_ = None
+        # 2/1 First compute embedding for each audio codebook sequence[:, 1:]
         for cb_index in range(self.num_audio_codebooks):
             audio_emb = self.emb[cb_index](
                 input_sequence[:, cb_index + self.audio_offset]
             )
+            # CHECK: this seems to be a more memory efficient way to do this than explicit sum as in audiocraft?
+            # Or not, since the gradient computation would still need to keep track of the summands?
             input_ = audio_emb if input_ is None else input_ + audio_emb
+        # 2/2 Compute text embedding for the first text token (sequence[:, 0])
         text_emb = self.text_emb(input_sequence[:, 0])
+        # Q: Why is the text embedding added to the audio embeddings? Isn't the text *concatenated* with the audio tokens?
+        # - It's not fully clear from the paper --> need to reread carefully
+        # - Maybe the multi-stream means actually that streams are summed internally (e.g. as done for the different codebook streams)
         input_ = text_emb if input_ is None else input_ + text_emb
         transformer_out = self.transformer(input_)
 
         if self.out_norm:
             transformer_out = self.out_norm(transformer_out)
         assert isinstance(transformer_out, torch.Tensor)
+        # 2/3 based on the pre-logits compute text_logits (just a linear head)
+        # So transformer_out is a combined representation of text and audio tokens
         text_logits = self.text_linear(transformer_out)
         text_logits = text_logits[:, None]
         return transformer_out, text_logits
 
+    # 4/0
     def forward_depformer(
         self,
-        depformer_cb_index: int,
-        sequence: torch.Tensor,
-        transformer_out: torch.Tensor,
+        depformer_cb_index: int,  # index of the codebook for which we generate the token (first index text token, then the audio tokens)
+        sequence: torch.Tensor,  
+        # sequence of tokens for each codebook (generated sequentially, by repated calls to this function)
+        # from the depformer_step, this seems only the prev. token (and not the whole sequence) is passed in here
+        # this is confirmed by the assert checks below
+        # CHECK: how this would be done for training
+        # - Do we apply this forward function once on the whole (ground-truth) sequence?
+        transformer_out: torch.Tensor,  # output of the temporal transformer (not chagned)
     ) -> torch.Tensor:
+        
         B, K, S = sequence.shape
         assert (
             K == 1
@@ -300,21 +321,29 @@ class LMModel(StreamingContainer):
             transformer_out.shape[1] == 1
         ), "Transformer out should be a for a single step."
         last_token_input: tp.Optional[torch.Tensor] = None
+        # 4/1 First, we apply only a linear layer (optionally a different one for each codebook) on the input.
         depformer_input = transformer_out
         if self.depformer_multi_linear:
             depformer_input = self.depformer_in[depformer_cb_index](depformer_input)
         else:
             depformer_input = self.depformer_in[0](depformer_input)
+        # 4/2 Then, we compute the embedding for the codebook sequence (prev. generated codebook token).
+        # QUESTION: what is the text embedding for the first cb_index?
         if depformer_cb_index == 0:
             last_token_input = self.depformer_text_emb(sequence[:, 0])
         else:
             last_token_input = self.depformer_emb[depformer_cb_index - 1](
                 sequence[:, 0]
             )
+        # 4/3 The final input is compute by summing the input sequence (i.e. prev. token) embedding an
+        # the temporal transformer output embedding (different for each cb_index)
         depformer_input = depformer_input + last_token_input
         assert depformer_input.shape[1] == 1
         # depformer_input is [B, 1, depformer_dim].
         # The streaming state of the depformer ensures that the proper layer is run.
+        
+        # 4/4 Compute the output by applying the forward function and final linear output projection (again spefific to cb_index)
+        # This is the same as in musicgen
         dep_output = self.depformer(depformer_input)
         logits = self.linears[depformer_cb_index](dep_output)
         logits = logits[:, None]
@@ -334,6 +363,7 @@ class _LMGenState:
         self.offset = 0
 
 
+# This seems to be the api class for the LMModel
 class LMGen(StreamingModule[_LMGenState]):
     def __init__(
         self,
@@ -378,6 +408,8 @@ class LMGen(StreamingModule[_LMGenState]):
 
         return _LMGenState(cache, initial, graphed_main, graphed_depth)
 
+    # 1/
+    # This is only for api/inference generaton mode (hence the torch.no_grad)
     @torch.no_grad()
     def step(self, input_tokens: torch.Tensor) -> torch.Tensor | None:
         state = self._streaming_state
@@ -413,6 +445,7 @@ class LMGen(StreamingModule[_LMGenState]):
                 state.cache[:, k, position] = state.initial[:, k, 0]
         input_ = state.cache[:, :, position : position + 1]
 
+        # CHECK: what below exactly does
         if self.check:
             # Check that we are not feeding in any value that is not generated yet.
             assert not (input_ == lm_model.ungenerated_token_id).any(), (
@@ -422,6 +455,10 @@ class LMGen(StreamingModule[_LMGenState]):
             assert (input_[:, lm_model.audio_offset :] <= lm_model.card).all(), input_
             assert (input_[:, :1] <= lm_model.text_card).all()
 
+        # 2/ forward_text
+        # This actually calls self.lm_model.forward_text
+        # - this applies the "temporal transformer" and returns a combined representation of text and audio tokens
+        # - the text_logits are a linear transformation of this representation
         transformer_out, text_logits = state.graphed_main(input_)
         # Shape of text_logits should be [B, K_text=1, T=1, Card_text]
         text_token = sample_token(
@@ -434,6 +471,11 @@ class LMGen(StreamingModule[_LMGenState]):
         assert text_token.shape[2] == 1
         assert text_token.shape[1] == 1, "Only one text stream supported."
         text_token = text_token[:, 0, 0]  # shape is [B]
+        
+        # 3/ depformer_step
+        # This actually calls depformer_step
+        # Which calls self.lm_model.forward_depformer sequentially for each codebook
+        # - transformer_out: output of the temporal transformer
         audio_tokens = state.graphed_depth(text_token, transformer_out)
 
         # ensure we don't overwrite prompt tokens, we only write over ungenerated tokens
@@ -453,20 +495,30 @@ class LMGen(StreamingModule[_LMGenState]):
         )
         out = state.cache.gather(dim=2, index=index)
         return out
-
+    # 3/0
+    # This is the generate function for the depformer
+    # transformer_out: output of the temporal transformer: is not changed
+    # depformer_tokens: list of tokens generated sequentially by the depformer
+    # CHECK: it seems this function is never called in the codebase
+    # -> A: it's actually called in the main `step` function via `graphed_depth`
     def depformer_step(
         self,
         text_token: torch.Tensor,
         transformer_out: torch.Tensor,
     ) -> torch.Tensor:
         (B,) = text_token.shape
+        # first token set to the text token
         prev_token = text_token
         lm_model = self.lm_model
         depformer_tokens: list[torch.Tensor] = []
         assert not lm_model.depformer.is_streaming
         with lm_model.depformer.streaming(B):
+            # We run it sequentially for all token dimensions
+            # The first dim refers to the text token
+            # The following dims refer to the audio tokens
             for cb_index in range(lm_model.dep_q):
                 input_ = prev_token[:, None, None]
+                # 4/ forward_depformer called on prev_token and transformer_out (that stays constant)
                 logits = lm_model.forward_depformer(cb_index, input_, transformer_out)
                 next_token = sample_token(
                     logits.float(),
