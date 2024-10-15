@@ -9,19 +9,19 @@ Optimized for inference.
 See `StreamingTransformer` for more information.
 """
 
+import typing as tp
 from contextlib import ExitStack
 from dataclasses import dataclass
-import typing as tp
 
-from einops import rearrange
 import torch
 import torch.nn as nn
+from einops import rearrange
 from torch.nn import functional as F
 
 from ..utils.compile import no_compile
 from .gating import make_gating
 from .rope import RotaryEmbedding
-from .streaming import StreamingModule, StreamingContainer
+from .streaming import StreamingContainer, StreamingModule
 
 
 class LayerNormF32(nn.LayerNorm):
@@ -357,6 +357,7 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         # TODO: the following estimation will not work great with FSDP.
         dtype = self.in_proj_weight.dtype
         dim_per_head = self.embed_dim // self.num_heads
+        # CACHE/ Here the kv_cache within the MHA is intialized
         kv_cache = RingKVCache(
             batch_size, self.num_heads, dim_per_head, capacity, device, dtype
         )

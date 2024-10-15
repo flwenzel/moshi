@@ -8,22 +8,18 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
-from functools import partial
 import logging
 import typing as tp
+from dataclasses import dataclass
+from functools import partial
 
 import torch
 from torch import nn
 
-from ..utils.sampling import sample_token
-from ..utils.compile import CUDAGraphed
 from ..modules.streaming import StreamingContainer, StreamingModule
-from ..modules.transformer import (
-    StreamingTransformer,
-    create_norm_fn,
-)
-
+from ..modules.transformer import StreamingTransformer, create_norm_fn
+from ..utils.compile import CUDAGraphed
+from ..utils.sampling import sample_token
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +269,7 @@ class LMModel(StreamingContainer):
         input_sequence = sequence
         input_ = None
         # 2/1 First compute embedding for each audio codebook sequence[:, 1:]
+        # This includes the audio for the input and the output stream (i.e. 16 entries)!
         for cb_index in range(self.num_audio_codebooks):
             audio_emb = self.emb[cb_index](
                 input_sequence[:, cb_index + self.audio_offset]
@@ -395,6 +392,7 @@ class LMGen(StreamingModule[_LMGenState]):
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
         lm_model = self.lm_model
         initial = lm_model._get_initial_token()
+        # CACHE/ This is determines the size of the chache --> why is it so small?
         cache = torch.full(
             (batch_size, self.lm_model.num_codebooks, self.max_delay + 2),
             lm_model.ungenerated_token_id,
@@ -427,23 +425,32 @@ class LMGen(StreamingModule[_LMGenState]):
             Ki == needed_tokens
         ), f"We expect {needed_tokens} tokens from the user stream, got {Ki}."
 
+        # CACHE/ this is only 3 for the demo --> why so small?
         CT = state.cache.shape[2]
 
-        for q_other in range(input_tokens.shape[1]):
+        # CACHE/ Here the state.cache is written
+        # Here we only writes the input tokens to the cache
+        for q_other in range(input_tokens.shape[1]):  # loops over codebooks from input stream
             k = lm_model.dep_q + 1 + q_other
             delay = lm_model.delays[k]
             write_position = (state.offset + delay) % CT
+            # k starts after the external stream codebooks
             state.cache[:, k, write_position : write_position + 1] = input_tokens[
                 :, q_other
             ]
 
-        position = state.offset % CT
+        position = state.offset % CT  # CACHE/ Ring cache position
         for k, delay in enumerate(lm_model.delays):
             # Only for the very beginning, we extend the initial token for the acoustic
             # token that are delayed, and thus have no good value to take.
             if state.offset <= delay:
                 state.cache[:, k, position] = state.initial[:, k, 0]
+        # CACHE/ This is the final input to the model, it's taken from the cache
+        # Shape is [1, K + 1 + K, 1] --> So it both stores the input and the outputs stream
+        
+        # 1/2 This is the final input to the model. It is conposed of the input tokens and the generated tokens 
         input_ = state.cache[:, :, position : position + 1]
+        
 
         # CHECK: what below exactly does
         if self.check:
@@ -481,6 +488,7 @@ class LMGen(StreamingModule[_LMGenState]):
         # ensure we don't overwrite prompt tokens, we only write over ungenerated tokens
         state.offset += 1
         position = state.offset % CT
+        # CACHE/ Here we write the generated audio tokens to the cache
         state.cache[:, 0, position] = text_token
         state.cache[:, 1 : lm_model.dep_q + 1, position] = audio_tokens
 
@@ -530,6 +538,75 @@ class LMGen(StreamingModule[_LMGenState]):
                 next_token = next_token[:, 0, 0]  # shape is B
                 depformer_tokens.append(next_token)
                 prev_token = next_token
+
+        assert len(depformer_tokens) == lm_model.dep_q, (
+            len(depformer_tokens),
+            lm_model.dep_q,
+        )
+        out = torch.stack(depformer_tokens, dim=1)
+        assert out.shape == (B, lm_model.dep_q), out.shape
+        return out
+
+class LMNoStream:
+
+    def __init__(self, lm_model: LMModel, check: bool = False):
+        self.lm_model = lm_model
+        self.check = check
+
+    def step(self, input_tokens: torch.Tensor, text_tokens: torch.Tensor, output_tokens: torch.Tensor) -> torch.Tensor | None:
+        lm_model = self.lm_model
+
+        assert input_tokens.dim() == 3, "Shape should be [B, K, T]."
+        B, Ki, S = input_tokens.shape
+        needed_tokens = lm_model.num_codebooks - lm_model.dep_q - 1
+        assert (
+            Ki == needed_tokens
+        ), f"We expect {needed_tokens} tokens from the user stream, got {Ki}."
+
+        input_ = torch.cat([output_tokens, text_tokens, input_tokens], dim=1)
+
+        if self.check:
+            assert (input_[:, lm_model.audio_offset :] <= lm_model.card).all(), input_
+            assert (input_[:, :1] <= lm_model.text_card).all()
+        
+        # 2/ forward_text
+        transformer_out, text_logits = self.lm_model.forward_text(input_)
+
+        assert text_tokens.dim() == 3, text_tokens.shape
+        assert text_tokens.shape[2] == 1
+        assert text_tokens.shape[1] == 1, "Only one text stream supported."
+        text_tokens = text_tokens[:, 0, 0]  # shape is [B]
+
+        # 3/ depformer_step
+        audio_tokens = self.depformer_step(text_tokens, transformer_out)
+        return audio_tokens
+    
+    def depformer_step(
+        self,
+        text_token: torch.Tensor,
+        transformer_out: torch.Tensor,
+    ) -> torch.Tensor:
+        (B,) = text_token.shape
+        # first token set to the text token
+        prev_token = text_token
+        lm_model = self.lm_model
+        depformer_tokens: list[torch.Tensor] = []
+        # assert not lm_model.depformer.is_streaming
+        # with lm_model.depformer.streaming(B):
+
+        for cb_index in range(lm_model.dep_q):
+            input_ = prev_token[:, None, None]
+            logits = lm_model.forward_depformer(cb_index, input_, transformer_out)
+            next_token = sample_token(
+                logits.float(),
+                self.use_sampling,
+                self.temp,
+                self.top_k,
+            )
+            assert next_token.shape == (B, 1, 1)
+            next_token = next_token[:, 0, 0]  # shape is B
+            depformer_tokens.append(next_token)
+            prev_token = next_token
 
         assert len(depformer_tokens) == lm_model.dep_q, (
             len(depformer_tokens),
