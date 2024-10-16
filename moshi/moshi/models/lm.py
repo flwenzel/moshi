@@ -475,7 +475,7 @@ class LMGen(StreamingModule[_LMGenState]):
             self.top_k_text,
         )
         assert text_token.dim() == 3, text_token.shape
-        assert text_token.shape[2] == 1
+        assert text_token.shape[2] == 1 
         assert text_token.shape[1] == 1, "Only one text stream supported."
         text_token = text_token[:, 0, 0]  # shape is [B]
         
@@ -483,7 +483,7 @@ class LMGen(StreamingModule[_LMGenState]):
         # This actually calls depformer_step
         # Which calls self.lm_model.forward_depformer sequentially for each codebook
         # - transformer_out: output of the temporal transformer
-        audio_tokens = state.graphed_depth(text_token, transformer_out)
+        audio_tokens, audio_logits = state.graphed_depth(text_token, transformer_out)
 
         # ensure we don't overwrite prompt tokens, we only write over ungenerated tokens
         state.offset += 1
@@ -502,7 +502,8 @@ class LMGen(StreamingModule[_LMGenState]):
             .expand(B, -1, 1)
         )
         out = state.cache.gather(dim=2, index=index)
-        return out
+        input_sequence = input_
+        return out, input_sequence, transformer_out, text_logits, text_token, audio_logits, audio_tokens
     # 3/0
     # This is the generate function for the depformer
     # transformer_out: output of the temporal transformer: is not changed
@@ -519,6 +520,7 @@ class LMGen(StreamingModule[_LMGenState]):
         prev_token = text_token
         lm_model = self.lm_model
         depformer_tokens: list[torch.Tensor] = []
+        logits_all = []
         assert not lm_model.depformer.is_streaming
         with lm_model.depformer.streaming(B):
             # We run it sequentially for all token dimensions
@@ -537,6 +539,7 @@ class LMGen(StreamingModule[_LMGenState]):
                 assert next_token.shape == (B, 1, 1)
                 next_token = next_token[:, 0, 0]  # shape is B
                 depformer_tokens.append(next_token)
+                logits_all.append(logits.clone())
                 prev_token = next_token
 
         assert len(depformer_tokens) == lm_model.dep_q, (
@@ -544,8 +547,9 @@ class LMGen(StreamingModule[_LMGenState]):
             lm_model.dep_q,
         )
         out = torch.stack(depformer_tokens, dim=1)
+        logits_all = torch.stack(logits_all, dim=1)
         assert out.shape == (B, lm_model.dep_q), out.shape
-        return out
+        return out, logits_all
 
 class LMNoStream:
 
@@ -553,7 +557,7 @@ class LMNoStream:
         self.lm_model = lm_model
         self.check = check
 
-    def step(self, input_tokens: torch.Tensor, text_tokens: torch.Tensor, output_tokens: torch.Tensor) -> torch.Tensor | None:
+    def forward(self, input_tokens: torch.Tensor, text_tokens: torch.Tensor, output_tokens: torch.Tensor) -> torch.Tensor | None:
         lm_model = self.lm_model
 
         assert input_tokens.dim() == 3, "Shape should be [B, K, T]."
@@ -566,9 +570,9 @@ class LMNoStream:
         input_ = torch.cat([output_tokens, text_tokens, input_tokens], dim=1)
 
         if self.check:
-            assert (input_[:, lm_model.audio_offset :] <= lm_model.card).all(), input_
+            assert (input_[:, lm_model.audio_offset:] <= lm_model.card).all(), input_
             assert (input_[:, :1] <= lm_model.text_card).all()
-        
+
         # 2/ forward_text
         transformer_out, text_logits = self.lm_model.forward_text(input_)
 
@@ -580,38 +584,47 @@ class LMNoStream:
         # 3/ depformer_step
         audio_tokens = self.depformer_step(text_tokens, transformer_out)
         return audio_tokens
-    
-    def depformer_step(
-        self,
-        text_token: torch.Tensor,
-        transformer_out: torch.Tensor,
-    ) -> torch.Tensor:
-        (B,) = text_token.shape
-        # first token set to the text token
-        prev_token = text_token
-        lm_model = self.lm_model
-        depformer_tokens: list[torch.Tensor] = []
-        # assert not lm_model.depformer.is_streaming
-        # with lm_model.depformer.streaming(B):
 
-        for cb_index in range(lm_model.dep_q):
-            input_ = prev_token[:, None, None]
-            logits = lm_model.forward_depformer(cb_index, input_, transformer_out)
-            next_token = sample_token(
-                logits.float(),
-                self.use_sampling,
-                self.temp,
-                self.top_k,
-            )
-            assert next_token.shape == (B, 1, 1)
-            next_token = next_token[:, 0, 0]  # shape is B
-            depformer_tokens.append(next_token)
-            prev_token = next_token
+    # def depformer_forward(
+    #     self,
+    #     input_tokens: torch.Tensor,
+    #     text_tokens: torch.Tensor,
+    #     output_tokens: torch.Tensor,
+    #     transformer_out: torch.Tensor,
+    # ) -> torch.Tensor:
+    #     for cb_index
 
-        assert len(depformer_tokens) == lm_model.dep_q, (
-            len(depformer_tokens),
-            lm_model.dep_q,
-        )
-        out = torch.stack(depformer_tokens, dim=1)
-        assert out.shape == (B, lm_model.dep_q), out.shape
-        return out
+    # def depformer_step(
+    #     self,
+    #     text_token: torch.Tensor,
+    #     transformer_out: torch.Tensor,
+    # ) -> torch.Tensor:
+    #     (B,) = text_token.shape
+    #     # first token set to the text token
+    #     prev_token = text_token
+    #     lm_model = self.lm_model
+    #     depformer_tokens: list[torch.Tensor] = []
+    #     # assert not lm_model.depformer.is_streaming
+    #     # with lm_model.depformer.streaming(B):
+
+    #     for cb_index in range(lm_model.):
+    #         input_ = prev_token[:, None, None]
+    #         logits = lm_model.forward_depformer(cb_index, input_, transformer_out)
+    #         next_token = sample_token(
+    #             logits.float(),
+    #             self.use_sampling,
+    #             self.temp,
+    #             self.top_k,
+    #         )
+    #         assert next_token.shape == (B, 1, 1)
+    #         next_token = next_token[:, 0, 0]  # shape is B
+    #         depformer_tokens.append(next_token)
+    #         prev_token = next_token
+
+    #     assert len(depformer_tokens) == lm_model.dep_q, (
+    #         len(depformer_tokens),
+    #         lm_model.dep_q,
+    #     )
+    #     out = torch.stack(depformer_tokens, dim=1)
+    #     assert out.shape == (B, lm_model.dep_q), out.shape
+    #     return out
