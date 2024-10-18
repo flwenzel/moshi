@@ -239,12 +239,14 @@ class RingKVCache:
     def reset(self):
         self.end_offset.zero_()
 
+    # /CACHE this writes the new keys and values to the cache and returns all previous ones
     def complete(self, k: torch.Tensor, v: torch.Tensor) -> KVCacheResult:
+        # /CACHE this basically just copies the keys and values to the cache
         assert k.shape[:-1] == v.shape[:-1], (k.shape, v.shape)
         B, H, T, D = k.shape
         indexes = torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype) + self.end_offset
         indexes = indexes % self.capacity
-        self.cache[0].index_copy_(2, indexes, k)
+        self.cache[0].index_copy_(2, indexes, k)  # dim, index, source
         self.cache[1].index_copy_(2, indexes, v)
         self.end_offset.add_(T)
 
@@ -399,7 +401,7 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         if self.rope:
             q, k = self.rope(q, k, offset, time_before_heads=False)
 
-        k, v, pos_k = self._complete_kv(k, v)
+        k, v, pos_k = self._complete_kv(k, v)  # /CACHE this gives all the previous keys and values
         if self.causal:
             pos_k = pos_k.view(1, -1)
             pos_q = offset + torch.arange(T, device=q.device, dtype=torch.long).view(

@@ -351,7 +351,7 @@ class LMModel(StreamingContainer):
 @dataclass
 class _LMGenState:
     cache: torch.Tensor
-    initial: torch.Tensor
+    initial: torch.Tensor  # this is used to init the cache befare offset >= delay
     # /STREAM: why do we track state of these graphed functions?
     graphed_main: CUDAGraphed
     graphed_depth: CUDAGraphed
@@ -438,29 +438,36 @@ class LMGen(StreamingModule[_LMGenState]):
         CT = state.cache.shape[2]
 
         # CACHE/ Here the state.cache is written
-        # Here we only writes the input tokens to the cache
+        # Here we write the input tokens to the cache (respecting the delays)
+        
         # STREAM/ the cache logic could be abstracted away. It feels we shouldn't care how to write and read to the cache
         # e.g. we should have only a write_cache and read_cache functions
         # ok, in some sense it's a bit specific, e.g. where to write input/output tokens
         for q_other in range(input_tokens.shape[1]):  # loops over codebooks from input stream
+            # For each input codebook:
             k = lm_model.dep_q + 1 + q_other
-            delay = lm_model.delays[k]
+            delay = lm_model.delays[k]  # [0, 1, 1, 1, 1, 1, 1, 1],  0 for the semantic codebook    
+            # get write pos: (offset + delay) % CT
+            # offset is the current position in the cache (it's just incremented)
             write_position = (state.offset + delay) % CT
             # k starts after the external stream codebooks
             state.cache[:, k, write_position : write_position + 1] = input_tokens[
                 :, q_other
             ]
 
-        position = state.offset % CT  # CACHE/ Ring cache position
+        # CACHE/ For the very initial tokens (offset <= delay), we write initial values to the cache
+        # We could do this we gather similar to the output tokens (see below), right!?
+        position = state.offset % CT
         for k, delay in enumerate(lm_model.delays):
             # Only for the very beginning, we extend the initial token for the acoustic
             # token that are delayed, and thus have no good value to take.
             if state.offset <= delay:
-                state.cache[:, k, position] = state.initial[:, k, 0]
+                state.cache[:, k, position] = state.initial[:, k, 0]  # initial has shape [B, K, 1]
         # CACHE/ This is the final input to the model, it's taken from the cache
         # Shape is [1, K + 1 + K, 1] --> So it both stores the input and the outputs stream
         
         # 1/2 This is the final input to the model. It is conposed of the input tokens and the generated tokens 
+        # CACHE/ this is just the complete state vector for the current pos
         input_ = state.cache[:, :, position : position + 1]
         
 
@@ -497,16 +504,23 @@ class LMGen(StreamingModule[_LMGenState]):
         # - transformer_out: output of the temporal transformer
         audio_tokens, audio_logits = state.graphed_depth(text_token, transformer_out)
 
+        # /CACHE: Now we write the generated output back to the cache (i.e. the first 8 tokens in the cache)
         # ensure we don't overwrite prompt tokens, we only write over ungenerated tokens
+        # Why do we increment the offset by one and don't use delays? --> See below
         state.offset += 1
         position = state.offset % CT
-        # CACHE/ Here we write the generated audio tokens to the cache
         state.cache[:, 0, position] = text_token
         state.cache[:, 1 : lm_model.dep_q + 1, position] = audio_tokens
 
+        # Wait until we have enough tokens to generate an output
         if state.offset <= self.max_delay:
             return None
+        # Now we actually apply the delays to the output tokens
         B = state.cache.shape[0]
+        # We go actually back in the position to get the output tokens
+        # /CACHE: this seems a bit complex: why don't we store tokens at the right position in the cache?
+        # This seems to be due to the generation. I.e. the tokens generated now were actually the inputs one time step
+        # earlier. --> For training (where all the tokens already exist) we probably don't need this
         gen_delays_cuda = self.delays_cuda[: lm_model.dep_q + 1]
         index = (
             ((state.offset - self.max_delay + gen_delays_cuda) % CT)
