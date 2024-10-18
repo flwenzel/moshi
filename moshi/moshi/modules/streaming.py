@@ -13,13 +13,14 @@ Streaming module API that should be implemented by all Streaming components,
 """
 
 import abc
-from contextlib import contextmanager
-from dataclasses import dataclass
 import itertools
 import math
 import typing as tp
-from torch import nn
+from contextlib import contextmanager
+from dataclasses import dataclass
+
 import torch
+from torch import nn
 
 
 class Resetable(tp.Protocol):
@@ -30,6 +31,12 @@ class Resetable(tp.Protocol):
 State = tp.TypeVar("State", bound=Resetable)
 
 
+#/STREAM base module
+# Q: Why do we inherit from the state?
+# - 1/ The inheritance from tp.Generic[State] in the StreamingModule class is used to provide type safety and flexibility by parameterizing the class with a specific type for its state. This allows the StreamingModule to be generalized across different kinds of streaming modules that might use different types of state objects.
+# - The State type variable is defined as a subclass of Resetable (i.e., State = tp.TypeVar("State", bound=Resetable)), meaning that whatever type is passed for State must implement the reset method.
+# - 2/ By using tp.Generic[State], the type of the state (self._streaming_state) becomes more specific in each subclass of StreamingModule
+# - So with static type checking we know the type of the State object in each subclass of StreamingModule (otherwise it would be ambigious)
 class StreamingModule(abc.ABC, nn.Module, tp.Generic[State]):
     """Common API for streaming components.
 
@@ -106,11 +113,13 @@ class StreamingModule(abc.ABC, nn.Module, tp.Generic[State]):
     def streaming(self, batch_size: int):
         """Context manager to enter streaming mode. Reset streaming state on exit."""
 
-        self._start_streaming(batch_size)
+        # /STREAM: so this context manager actually doesn't assign a variable in the with statement
+        # (empty yield)
+        self._start_streaming(batch_size)  # this is the __enter__ block
         try:
-            yield
+            yield # this is the return value of the __enter__ block
         finally:
-            self._stop_streaming()
+            self._stop_streaming() # this is the __exit__ block
 
     def reset_streaming(self):
         """Reset the streaming state."""
@@ -159,6 +168,8 @@ class _NullState:
         pass
 
 
+# Q: Why do we need a streaming container with a NullState?
+# - It might be used to wrap a module that doesn't need any streaming state, but has children that do.
 class StreamingContainer(StreamingModule[_NullState]):
     def _init_streaming_state(self, batch_size: int) -> _NullState:
         return _NullState()
@@ -174,6 +185,12 @@ class _StreamingAddState:
         self.previous_y = None
 
 
+# /STREAM: What is this doing?
+# It seems that prev_x, prev_y are never written since m_l always points to the end of the sequence x, y
+#
+# If streaming is active, it first concatenates the previous chunk (previous_x and previous_y) with the current chunk
+# of x and y. It then processes the concatenated tensors up to the minimal length (m_l), updates the state with the
+# unprocessed part (if any), and returns the sum of the matching parts of x and y.
 class StreamingAdd(StreamingModule[_StreamingAddState]):
     def _init_streaming_state(self, batch_size: int) -> _StreamingAddState:
         return _StreamingAddState()
