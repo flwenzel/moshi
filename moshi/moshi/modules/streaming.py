@@ -73,11 +73,17 @@ class StreamingModule(abc.ABC, nn.Module, tp.Generic[State]):
     def set_streaming_propagate(self, streaming_propagate: bool):
         self._streaming_propagate = streaming_propagate
 
+    # /STREAM Used to apply a function to the module and all its children
     def _apply_named_streaming(self, fn: tp.Any):
+        # Recursively applies the _handle_module on all children
         def _handle_module(prefix: str, module: nn.Module, recurse: bool = True):
             propagate = True
             if isinstance(module, StreamingModule):
+                # Apply function
                 if module._streaming_propagate:
+                    # Function gets prefix = "path of module names"
+                    # Notebook tests showed that the highest level module doesn't have a name
+                    # So the name path for grandparent is "" and for parent is "parent_name" and for child is "parent_name.child_name"
                     fn(prefix, module)
                 else:
                     propagate = False
@@ -87,6 +93,8 @@ class StreamingModule(abc.ABC, nn.Module, tp.Generic[State]):
                 for name, child in module.named_children():
                     _handle_module(prefix + "." + name, child)
 
+        # Here we can see why the highest level module doesn't have a name and the recursion
+        # only starts athe second level
         _handle_module("", self, recurse=False)
         for name, child in self.named_children():
             _handle_module(name, child)
@@ -109,6 +117,8 @@ class StreamingModule(abc.ABC, nn.Module, tp.Generic[State]):
     def streaming_forever(self, batch_size: int):
         self._start_streaming(batch_size)
 
+    # /STREAM: Q: Why do we need to pass the batch_size?
+    # - The batch_size is (only potentially) needed to initialize the streaming state 
     @contextmanager
     def streaming(self, batch_size: int):
         """Context manager to enter streaming mode. Reset streaming state on exit."""
@@ -117,7 +127,7 @@ class StreamingModule(abc.ABC, nn.Module, tp.Generic[State]):
         # (empty yield)
         self._start_streaming(batch_size)  # this is the __enter__ block
         try:
-            yield # this is the return value of the __enter__ block
+            yield  # this is the return value of the __enter__ block
         finally:
             self._stop_streaming() # this is the __exit__ block
 

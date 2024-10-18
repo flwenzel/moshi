@@ -352,11 +352,15 @@ class LMModel(StreamingContainer):
 class _LMGenState:
     cache: torch.Tensor
     initial: torch.Tensor
+    # /STREAM: why do we track state of these graphed functions?
     graphed_main: CUDAGraphed
     graphed_depth: CUDAGraphed
     offset: int = 0
 
     def reset(self):
+        # /CACHE Why don't we delete the cache?
+        # - Since it's overwritten in the _init_streaming_state anyway
+        # - But this seems to be not fully consistent with the idea behind the reset function
         self.offset = 0
 
 
@@ -393,6 +397,11 @@ class LMGen(StreamingModule[_LMGenState]):
         lm_model = self.lm_model
         initial = lm_model._get_initial_token()
         # CACHE/ This is determines the size of the chache --> why is it so small?
+        # - It's only used to store the delay pattern of "unprocessed" tokens
+        # - The real cache is the KV cache in the transformer
+
+        # first fill the cache with "ungenerated_token_id" tokens
+        # cache size = self.max_delay + 2
         cache = torch.full(
             (batch_size, self.lm_model.num_codebooks, self.max_delay + 2),
             lm_model.ungenerated_token_id,
@@ -425,11 +434,14 @@ class LMGen(StreamingModule[_LMGenState]):
             Ki == needed_tokens
         ), f"We expect {needed_tokens} tokens from the user stream, got {Ki}."
 
-        # CACHE/ this is only 3 for the demo --> why so small?
+        # CACHE/ this is the cache size (max_delay + 2)
         CT = state.cache.shape[2]
 
         # CACHE/ Here the state.cache is written
         # Here we only writes the input tokens to the cache
+        # STREAM/ the cache logic could be abstracted away. It feels we shouldn't care how to write and read to the cache
+        # e.g. we should have only a write_cache and read_cache functions
+        # ok, in some sense it's a bit specific, e.g. where to write input/output tokens
         for q_other in range(input_tokens.shape[1]):  # loops over codebooks from input stream
             k = lm_model.dep_q + 1 + q_other
             delay = lm_model.delays[k]

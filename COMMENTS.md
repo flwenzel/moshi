@@ -13,3 +13,10 @@
   * for a given module, this just assigns an init value module._streaming_state
   * `_init_streaming_state` has to be implemented by the module
 * `_apply_named_streaming`: 
+
+`_apply_named_streaming
+* Used to apply a function to the module and all its children
+
+## Implementations of `StreamingModule`
+
+### `LMGen(StreamingModule[_LMGenState]`
