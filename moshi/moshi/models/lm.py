@@ -292,7 +292,7 @@ class LMModel(StreamingContainer):
         # So transformer_out is a combined representation of text and audio tokens
         text_logits = self.text_linear(transformer_out)
         text_logits = text_logits[:, None]
-        return transformer_out, text_logits
+        return transformer_out, text_logits, input_
 
     # 4/0
     def forward_depformer(
@@ -485,7 +485,7 @@ class LMGen(StreamingModule[_LMGenState]):
         # This actually calls self.lm_model.forward_text
         # - this applies the "temporal transformer" and returns a combined representation of text and audio tokens
         # - the text_logits are a linear transformation of this representation
-        transformer_out, text_logits = state.graphed_main(input_)
+        transformer_out, text_logits, transformer_input = state.graphed_main(input_)
         # Shape of text_logits should be [B, K_text=1, T=1, Card_text]
         text_token = sample_token(
             text_logits.float(),
@@ -516,7 +516,7 @@ class LMGen(StreamingModule[_LMGenState]):
         if state.offset <= self.max_delay:
             # TODO(florian): revert!
             # return None
-            return None, input_, transformer_out, text_logits, text_token, audio_logits, audio_tokens
+            return None, input_, transformer_out, transformer_input, text_logits, text_token, audio_logits, audio_tokens
         # Now we actually apply the delays to the output tokens
         B = state.cache.shape[0]
         # We go actually back in the position to get the output tokens
@@ -530,7 +530,7 @@ class LMGen(StreamingModule[_LMGenState]):
             .expand(B, -1, 1)
         )
         out = state.cache.gather(dim=2, index=index)
-        return out, input_, transformer_out, text_logits, text_token, audio_logits, audio_tokens
+        return out, input_, transformer_out, transformer_input, text_logits, text_token, audio_logits, audio_tokens
     # 3/0
     # This is the generate function for the depformer
     # transformer_out: output of the temporal transformer: is not changed

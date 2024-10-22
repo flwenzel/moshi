@@ -675,7 +675,7 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         return _TransformerState(offset=torch.zeros(1, device=device, dtype=torch.long))
 
     def forward(self, x: torch.Tensor, *args, **kwargs):
-        B, T, C = x.shape
+        B, T, C = x.shape  # should be B, T, dim
 
         state = self._streaming_state
         if state is None:
