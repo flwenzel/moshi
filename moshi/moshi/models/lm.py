@@ -514,7 +514,9 @@ class LMGen(StreamingModule[_LMGenState]):
 
         # Wait until we have enough tokens to generate an output
         if state.offset <= self.max_delay:
-            return None
+            # TODO(florian): revert!
+            # return None
+            return None, input_, transformer_out, text_logits, text_token, audio_logits, audio_tokens
         # Now we actually apply the delays to the output tokens
         B = state.cache.shape[0]
         # We go actually back in the position to get the output tokens
@@ -528,8 +530,7 @@ class LMGen(StreamingModule[_LMGenState]):
             .expand(B, -1, 1)
         )
         out = state.cache.gather(dim=2, index=index)
-        input_sequence = input_
-        return out, input_sequence, transformer_out, text_logits, text_token, audio_logits, audio_tokens
+        return out, input_, transformer_out, text_logits, text_token, audio_logits, audio_tokens
     # 3/0
     # This is the generate function for the depformer
     # transformer_out: output of the temporal transformer: is not changed
