@@ -324,6 +324,9 @@ class LMModel(StreamingContainer):
             depformer_input = self.depformer_in[depformer_cb_index](depformer_input)
         else:
             depformer_input = self.depformer_in[0](depformer_input)
+        
+        # DEBUG: here depformer_input the same
+
         # 4/2 Then, we compute the embedding for the codebook sequence (prev. generated codebook token).
         # QUESTION: what is the text embedding for the first cb_index?
         if depformer_cb_index == 0:
@@ -335,6 +338,9 @@ class LMModel(StreamingContainer):
         # 4/3 The final input is compute by summing the input sequence (i.e. prev. token) embedding an
         # the temporal transformer output embedding (different for each cb_index)
         depformer_input = depformer_input + last_token_input
+
+        # DEBUG: here depformer_input the same
+
         assert depformer_input.shape[1] == 1
         # depformer_input is [B, 1, depformer_dim].
         # The streaming state of the depformer ensures that the proper layer is run.
@@ -342,10 +348,63 @@ class LMModel(StreamingContainer):
         # 4/4 Compute the output by applying the forward function and final linear output projection (again spefific to cb_index)
         # This is the same as in musicgen
         dep_output = self.depformer(depformer_input)
+        depformer_debug = dep_output.clone()
         logits = self.linears[depformer_cb_index](dep_output)
         logits = logits[:, None]
         assert logits.dim() == 4, logits.shape  # [B, Ka, S, card]
-        return logits
+        return logits, depformer_debug
+    
+    def forward_depformer_all_codes(
+        self,
+        sequence: torch.Tensor,
+        # sequence of tokens for each codebook (generated sequentially, by repated calls to this function)
+        # from the depformer_step, this seems only the prev. token (and not the whole sequence) is passed in here
+        # this is confirmed by the assert checks below
+        # CHECK: how this would be done for training
+        # - Do we apply this forward function once on the whole (ground-truth) sequence?
+        transformer_out: torch.Tensor,  # output of the temporal transformer (not chagned)
+    ) -> torch.Tensor:
+        
+        B, K, S = sequence.shape
+        assert (
+            S == 1
+        ), f"Steps for Depformer streaming should be passed 1 by 1, got {S}."
+        assert (
+            transformer_out.shape[1] == 1
+        ), "Transformer out should be a for a single step."
+        # 4/1 First, we apply only a linear layer (optionally a different one for each codebook) on the transformer_out.
+        if self.depformer_multi_linear:
+            depformer_input = [self.depformer_in[k](transformer_out) for k in range(K - 1)]
+        else:
+            depformer_input = self.depformer_in[0](transformer_out)
+        depformer_input = torch.cat(depformer_input, dim=1)
+        
+        # DEBUG: here depformer_input is the same
+        
+        # 4/2 Then, we compute the embedding for the codebook sequence (prev. generated codebook token).
+        text_input = self.depformer_text_emb(sequence[:, 0])  # [B, dim, 1]
+        # We have only 7 modules in self.depformer_emb which are applied to the prev. generated audio tokens
+        # (i.e. the last token) is not passed in here
+        audio_inputs = torch.stack([self.depformer_emb[k](sequence[:, k+1, 0]) for k in range(K - 2)], dim=1) # [B, Ka - 1, dim]
+        code_inputs = torch.cat([text_input, audio_inputs], dim=1)  # [B, K - 1, dim]
+        # 4/3 The final input is compute by summing the input sequence (i.e. prev. token) embedding an
+        # the temporal transformer output embedding (different for each cb_index)
+        depformer_input = depformer_input + code_inputs  # [B, K - 1, dim]
+
+        # DEBUG: here depformer_input is the same
+        
+
+        # 4/4 Compute the output by applying the forward function and final linear output projection (again spefific to cb_index)
+        # This is the same as in musicgen
+        dep_output = self.depformer(depformer_input)
+        depformer_debug = dep_output.clone()
+        # DEBUG: dep_output
+        logits = [self.linears[k](dep_output[:,k,:]) for k in range(K-1)]
+        logits = torch.stack(logits, dim=1)
+        logits = logits.unsqueeze(2)  # [B, Ka, S, card]
+        assert logits.dim() == 4, logits.shape 
+        
+        return logits, depformer_debug
 
 
 @dataclass
@@ -556,7 +615,7 @@ class LMGen(StreamingModule[_LMGenState]):
             for cb_index in range(lm_model.dep_q):
                 input_ = prev_token[:, None, None]
                 # 4/ forward_depformer called on prev_token and transformer_out (that stays constant)
-                logits = lm_model.forward_depformer(cb_index, input_, transformer_out)
+                logits, _ = lm_model.forward_depformer(cb_index, input_, transformer_out)
                 next_token = sample_token(
                     logits.float(),
                     self.use_sampling,
