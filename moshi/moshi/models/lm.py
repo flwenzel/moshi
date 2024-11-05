@@ -348,7 +348,7 @@ class LMModel(StreamingContainer):
         # 4/4 Compute the output by applying the forward function and final linear output projection (again spefific to cb_index)
         # This is the same as in musicgen
         dep_output = self.depformer(depformer_input)
-        depformer_debug = dep_output.clone()
+        depformer_debug = dep_output.detach().clone()
         logits = self.linears[depformer_cb_index](dep_output)
         logits = logits[:, None]
         assert logits.dim() == 4, logits.shape  # [B, Ka, S, card]
@@ -380,6 +380,8 @@ class LMModel(StreamingContainer):
         depformer_input = torch.cat(depformer_input, dim=1)
         
         # DEBUG: here depformer_input is the same
+        # DEBUG 2: here depformer_input is the same
+        
         
         # 4/2 Then, we compute the embedding for the codebook sequence (prev. generated codebook token).
         text_input = self.depformer_text_emb(sequence[:, 0])  # [B, dim, 1]
@@ -392,12 +394,14 @@ class LMModel(StreamingContainer):
         depformer_input = depformer_input + code_inputs  # [B, K - 1, dim]
 
         # DEBUG: here depformer_input is the same
-        
+        # DEBUG 2: here depformer_input is the same
+        depformer_debug = depformer_input.detach().clone()
 
         # 4/4 Compute the output by applying the forward function and final linear output projection (again spefific to cb_index)
         # This is the same as in musicgen
+        print(depformer_input.shape)
         dep_output = self.depformer(depformer_input)
-        depformer_debug = dep_output.clone()
+        # depformer_debug = dep_output.detach().clone()
         # DEBUG: dep_output
         logits = [self.linears[k](dep_output[:,k,:]) for k in range(K-1)]
         logits = torch.stack(logits, dim=1)
@@ -469,6 +473,7 @@ class LMGen(StreamingModule[_LMGenState]):
         )
 
         disable = lm_model.device.type != 'cuda'
+        disable = True
         graphed_main = CUDAGraphed(lm_model.forward_text, disable=disable)
         graphed_depth = CUDAGraphed(self.depformer_step, disable=disable)
 
